@@ -16,6 +16,7 @@ from skimage.morphology import (
     cube,
     ball                                                    # ← NEW
 )
+import os
 from skimage.filters import threshold_local, threshold_otsu
 import tifffile as tiff
 from scipy.ndimage import distance_transform_edt, map_coordinates
@@ -51,9 +52,11 @@ logging.info("Logging reconfigured after imports.")
 ########################################################
 
 # ------- Input / Output ----------
-# input_file = "NPN04_MD.tif"  # .mat or .tif or .czi
-input_file = "fiber_network_2.mat"
+input_file = "NPN02_MD.tif"  # .mat or .tif or .czi
+# input_file = "fiber_network_2.mat"
 mat_variable_name = "fiber_network"  # variable name if .mat
+max_fibers_to_process = 2000
+slice_selection = 9
 
 # ------- Diam. thresholds (microns) -------
 diameter_threshold_max = 10.0
@@ -62,14 +65,14 @@ diameter_threshold_min = 0
 # ------- Sampling / Spacing --------
 # If your .mat or .tif is isotropic (Z=Y=X=1), just keep these =1.
 # For .tif with different z-spacing, set scaling_factor_z accordingly.
-# scaling_factor_z = 5.0
-# scaling_factor_y = 1.2044
-# scaling_factor_x = 1.2044
+scaling_factor_z = 5.0
+scaling_factor_y = 1.2044
+scaling_factor_x = 1.2044
 
 
-scaling_factor_z = 1.0
-scaling_factor_y = 1.0
-scaling_factor_x = 1.0
+# scaling_factor_z = 1.0
+# scaling_factor_y = 1.0
+# scaling_factor_x = 1.0
 sampling = np.array([scaling_factor_z, scaling_factor_y, scaling_factor_x])  # (sz, sy, sx)
 
 # ------- Overlay Output ----------
@@ -78,6 +81,177 @@ overlay_filename = "fiber_overlay.tif"
 ########################################################
 #                  Utility Functions
 ########################################################
+
+# --- Robust MAT-file reader (works for v7.3 HDF5 files) -----------------------
+import warnings
+try:
+    import h5py                      # HDF5 backend for -v7.3 files
+except ImportError:
+    h5py = None                      # handled later
+
+from scipy.io import loadmat         # still fine for classic MAT files
+
+def load_mat_any(filepath, variable=None):
+    """
+    Load a MATLAB file saved with *any* version.
+      • If `variable` is given, return that dataset (else raise).
+      • Otherwise, return the first non-meta dataset found.
+    Returned array is always transposed to (Z, Y, X) to keep the rest of the
+    pipeline unchanged.
+
+    Examples
+    --------
+    z_stack = load_mat_any("fiber_network_4.mat", "fiber_network")
+    z_stack = load_mat_any("legacy.mat")            # auto-detects the dataset
+    """
+    # ---------- 1) try the fast/classic route --------------------------------
+    try:
+        mat = loadmat(filepath, simplify_cells=True)
+        datasets = {k: v for k, v in mat.items() if not k.startswith("__")}
+        if not datasets:
+            raise KeyError("No datasets inside MAT file")
+
+        if variable:
+            if variable not in datasets:
+                raise KeyError(f"'{variable}' not found in {filepath}")
+            arr = datasets[variable]
+        else:
+            if len(datasets) > 1:
+                warnings.warn(f"Multiple variables found; using '{next(iter(datasets))}'.")
+            arr = next(iter(datasets.values()))
+
+        return np.asarray(arr).transpose(2, 1, 0)   # (Z,Y,X)
+
+    # ---------- 2) fall back to HDF5 route (v7.3) -----------------------------
+    except Exception as e:
+        if h5py is None:
+            raise RuntimeError(
+                "File looks like MATLAB v7.3 (HDF5) but h5py is missing. "
+                "Please `pip install h5py`."
+            ) from e
+
+        with h5py.File(filepath, "r") as f:
+            keys = list(f.keys())
+            if not keys:
+                raise RuntimeError("No datasets found in HDF5 MAT file")
+
+            if variable:
+                if variable not in f:
+                    raise KeyError(f"'{variable}' not found in {filepath}")
+                data = f[variable][()]
+            else:
+                if len(keys) > 1:
+                    warnings.warn(f"Multiple variables found; using '{keys[0]}'.")
+                data = f[keys[0]][()]
+
+        # np.ndarray comes out in Fortran order: axes = (X,Y,Z)
+        # Transpose to (Z,Y,X) for consistency with tif/3-D logic
+        return np.asarray(data).transpose(2, 1, 0)
+    
+from matplotlib import cm
+
+
+import numpy as np
+import matplotlib.pyplot as plt
+from matplotlib.colors import LinearSegmentedColormap
+
+def truncate_colormap(cmap_name, minval=0.2, maxval=1.0, n=256):
+    """
+    Return a new colormap based on `cmap_name`, but “cut off” below `minval`.
+    - cmap_name: string name (e.g. 'Blues', 'Greens', 'Reds') or a Colormap instance.
+    - minval, maxval: floats in [0,1] specifying the fraction of the original cmap to keep.
+      minval=0.2 means the bottom 20% of the original colormap (the whitest‐looking part)
+      is removed, so 0→0.2 of the original is never used.
+    - n: number of discrete color samples (256 is usually fine).
+    """
+    if isinstance(cmap_name, str):
+        base = plt.get_cmap(cmap_name)
+    else:
+        base = cmap_name
+    
+    # Sample `n` points between minval and maxval from the original colormap
+    colors = base(np.linspace(minval, maxval, n))
+    new_cmap = LinearSegmentedColormap.from_list(f"{base.name}_trunc", colors)
+    return new_cmap
+
+def plot_colored_fibers(traced_fibers, fiber_props,
+                        color_by='elevation',
+                        cmap_name='Greens',
+                        vmin=0,
+                        vmax=90,
+                        title=""):
+    import matplotlib.pyplot as plt
+    from matplotlib.colors import Normalize
+
+    if isinstance(cmap_name, str):
+        cmap = cm.get_cmap(cmap_name)
+    else:
+        cmap = cmap_name
+
+    norm = Normalize(vmin=vmin, vmax=vmax)
+    fig = plt.figure(figsize=(9, 8))
+    ax = fig.add_subplot(111, projection='3d')
+
+    for voxels, props in zip(traced_fibers, fiber_props):
+        value = props[color_by]
+        color = cmap(norm(value))
+        scaled_voxels = voxels * sampling
+        X = scaled_voxels[:, 2]
+        Y = scaled_voxels[:, 1]
+        Z = scaled_voxels[:, 0]
+        ax.plot(X, Y, Z, color=color, linewidth=2)
+
+    mappable = cm.ScalarMappable(norm=norm, cmap=cmap)
+    mappable.set_array([])
+    cbar = plt.colorbar(mappable, ax=ax, pad=0.1)
+    cbar.set_label(f"{color_by.capitalize()}")
+
+    ax.set_xlabel("X (µm)")
+    ax.set_ylabel("Y (µm)")
+    ax.set_zlabel("Z (µm)")
+    ax.set_title(title)
+    set_axes_equal(ax)
+    plt.tight_layout()
+    plt.show()
+
+def plot_colored_fibers_2d_projection(traced_fibers, fiber_props,
+                                      color_by='azimuth',
+                                      cmap_name='Blues',  # can be string or Colormap
+                                      vmin=0,
+                                      vmax=180,
+                                      title="2D Max Projection Colored by Azimuth (°)"):
+    import matplotlib.pyplot as plt
+    from matplotlib.colors import Normalize
+
+    # If user passed a string, turn it into a Colormap. Otherwise assume it's already a Colormap.
+    if isinstance(cmap_name, str):
+        cmap = cm.get_cmap(cmap_name)
+    else:
+        # Already a Colormap object (e.g. from truncate_colormap)
+        cmap = cmap_name
+
+    norm = Normalize(vmin=vmin, vmax=vmax)
+    fig, ax = plt.subplots(figsize=(9, 8))
+
+    for voxels, props in zip(traced_fibers, fiber_props):
+        value = props[color_by]
+        color = cmap(norm(value))
+        scaled_voxels = voxels * sampling
+        X = scaled_voxels[:, 2]  # x
+        Y = scaled_voxels[:, 1]  # y
+        ax.plot(X, Y, color=color, linewidth=1.5)
+
+    mappable = cm.ScalarMappable(norm=norm, cmap=cmap)
+    mappable.set_array([])
+    cbar = plt.colorbar(mappable, ax=ax, pad=0.01)
+    cbar.set_label(f"{color_by.capitalize()} (°)")
+
+    ax.set_xlabel("X (µm)")
+    ax.set_ylabel("Y (µm)")
+    ax.set_title(title)
+    ax.set_aspect('equal', adjustable='box')
+    plt.tight_layout()
+    plt.show()
 
 def compute_local_thickness(fiber_mask, max_radius=None):
     """
@@ -94,6 +268,7 @@ def compute_local_thickness(fiber_mask, max_radius=None):
         mask_new = eroded & (thickness_map == 0)
         thickness_map[mask_new] = 2 * r
     return thickness_map
+
 
 def thickness_map_iso(fiber_mask, sampling, iso=0.5):
     """
@@ -167,6 +342,7 @@ def plot_colored_fibers(traced_fibers, fiber_props, color_by='azimuth', cmap_nam
     ax.set_ylabel("Y (µm)")
     ax.set_zlabel("Z (µm)")
     ax.set_title(title)
+    set_axes_equal(ax)
     plt.tight_layout()
     plt.show()
 
@@ -526,7 +702,7 @@ def track_meets_criteria(track_prop,
     """
     length = track_prop['length']
     avg_diam = track_prop['avg_diameter']
-    if length < avg_diam:
+    if length < avg_diam * 3:
         return False
     if avg_diam < dia_min or avg_diam > dia_max:
         return False
@@ -637,23 +813,41 @@ def compute_mean_fiber_radius(dt_image):
         return 0.0
     return vals.mean()
 
-def compute_fiber_properties(traced_fibers, dt_image,
-                           fiber_segment, sampling,
-                           dia_min=diameter_threshold_min,
-                           dia_max=diameter_threshold_max):
+import numpy as np
+import logging
+from sklearn.decomposition import PCA
+
+def compute_fiber_properties(
+    traced_fibers,
+    dt_image,
+    fiber_segment,
+    sampling,
+    dia_min=diameter_threshold_min,
+    dia_max=diameter_threshold_max
+):
     """
     Computes properties for each traced fiber using advanced diameter computation.
-    traced_fibers: list of arrays in voxel coords (z,y,x).
-    dt_image: 3D array with shape (Z,Y,X), storing distances in microns.
-    fiber_segment: 3D boolean array of segmented fiber volume.
-    sampling: [sz, sy, sx] in microns per voxel.
+
+    traced_fibers: list of arrays in voxel coords (z, y, x).
+    dt_image: 3D array (shape: Z x Y x X) storing distance‐transform values in microns.
+    fiber_segment: 3D boolean array of the segmented volume (Z x Y x X).
+    sampling: array [sz, sy, sx] giving microns per voxel in each dimension.
+    dia_min, dia_max: diameter thresholds (in µm).
+
     Returns:
-      fiber_properties: list of dicts with length, diameter, tortuosity, orientation, etc.
+      fiber_properties: list of dicts with keys:
+        - 'length'       : total path length in µm
+        - 'diameter'     : average fiber diameter in µm
+        - 'tortuosity'   : path_length / straight_line_distance
+        - 'orientation'  : principal axis vector in (Z, Y, X) order (unit length)
+        - 'azimuth'      : angle in XY‐plane, in [0°, 180°]
+        - 'elevation'    : angle from XY‐plane up to Z, in [0°, 90°]
+        - 'curvature'    : average curvature (1/µm)
     """
     logging.info("Computing fiber properties...")
     fiber_properties = []
-    
-    # Initialize lists to store metrics for all fibers
+
+    # These lists collect per‐fiber az/el/diameter for summary statistics
     all_diameters = []
     all_elevations = []
     all_azimuths = []
@@ -661,137 +855,222 @@ def compute_fiber_properties(traced_fibers, dt_image,
     weighted_azimuth = 0.0
     weighted_elevation = 0.0
     weighted_diameter = 0.0
-    
+
     for idx, fiber_vox in enumerate(traced_fibers):
+        # Skip very short fibers
         if len(fiber_vox) < 2:
-            logging.warning(f"Fiber {idx + 1} is too short and will be skipped.")
+            logging.warning(f"Fiber {idx+1} is too short and will be skipped.")
             continue
-        
-        # Convert to real space for length/orientation/curvature
-        fiber_scaled = fiber_vox * sampling  # Nx3 in microns
 
-        # 1) Length
-        path_length = np.sum(np.linalg.norm(np.diff(fiber_scaled, axis=0), axis=1))
+        # STEP 1: Compute length in µm
+        # fiber_vox is Nx3 array of (z, y, x). Convert to physical coords via sampling.
+        fiber_scaled = fiber_vox.astype(float) * sampling  # shape (N, 3); order currently [Z, Y, X] in µm
+        # The first column is Z_phys, second is Y_phys, third is X_phys.
 
-        # 2) Diameters (cross-section approach)
+        # Path length = sum of Euclidean distances between consecutive points
+        diffs = np.diff(fiber_scaled, axis=0)
+        segment_lengths = np.linalg.norm(diffs, axis=1)
+        path_length = np.sum(segment_lengths)
+
+        # STEP 2: Compute diameters at each sampled point
         diameters = compute_diameters(fiber_vox, dt_image, fiber_segment)
         if diameters.size == 0:
-            logging.warning(f"Fiber {idx + 1} has no valid diameters. Skipped.")
+            logging.warning(f"Fiber {idx+1} has no valid diameters. Skipping.")
             continue
         avg_diameter = np.mean(diameters)
         all_diameters.append(avg_diameter)
 
-        # 3) Basic diameter filtering
-        if avg_diameter < dia_min or avg_diameter > dia_max:
-            logging.info(f"Fiber {idx + 1} excluded (diam={avg_diameter:.2f} µm out of range).")
-            all_diameters.pop()  # Remove the diameter we just added
+        # STEP 3: Basic diameter filtering
+        if (avg_diameter < dia_min) or (avg_diameter > dia_max):
+            logging.info(f"Fiber {idx+1} excluded: diameter {avg_diameter:.2f} µm out of range [{dia_min}, {dia_max}].")
+            all_diameters.pop()
             continue
-        if avg_diameter * 4 >= path_length:
-            logging.info(f"Fiber {idx + 1} excluded (diam >= length).")
-            all_diameters.pop()  # Remove the diameter we just added
+        if path_length <= np.max(sampling) - 1:
+            logging.info(f"Fiber {idx+1} excluded: diameter >= length (d*3 >= L).")
+            all_diameters.pop()
             continue
 
-        # 4) Tortuosity
-        straight_line_distance = np.linalg.norm(fiber_scaled[-1] - fiber_scaled[0])
+        # STEP 4: Compute tortuosity = path_length / straight_line_distance
+        start_pt = fiber_scaled[0]
+        end_pt = fiber_scaled[-1]
+        straight_line_distance = np.linalg.norm(end_pt - start_pt)
         if straight_line_distance <= 0:
             tortuosity = np.inf
         else:
             tortuosity = path_length / straight_line_distance
         if np.isnan(tortuosity) or np.isinf(tortuosity):
-            logging.warning(f"Fiber {idx + 1} has invalid tortuosity, skipping.")
-            all_diameters.pop()  # Remove the diameter we just added
+            logging.warning(f"Fiber {idx+1} has invalid tortuosity = {tortuosity}. Skipping.")
+            all_diameters.pop()
             continue
 
-        # 5) Orientation with PCA
-        pca = PCA(n_components=0.95)
+        # STEP 5: PCA‐based Orientation
+        # We want to run PCA in a conventional (X, Y, Z) Cartesian frame.
+        # Currently fiber_scaled columns are [Z_phys, Y_phys, X_phys]. We reorder to [X, Y, Z].
+        pts_xyz = fiber_scaled[:, [2, 1, 0]]  # shape (N, 3): columns = [X_phys, Y_phys, Z_phys]
+
         try:
-            pca.fit(fiber_scaled)  # fiber_scaled is in ZYX order (Nx3 array)
-            principal_axis = pca.components_[0]
+            # Perform PCA on the Nx3 array pts_xyz
+            pca = PCA(n_components=1)
+            pca.fit(pts_xyz)
+            principal_axis = pca.components_[0]  # unit vector in (X, Y, Z) order
 
-            # Reorder PCA components from [Z, Y, X] (ZYX input) → [X, Y, Z] (physical XYZ)
-            principal_axis_reordered = np.array([
-                principal_axis[2],  # X (original third axis in ZYX)
-                principal_axis[1],  # Y (unchanged)
-                principal_axis[0]   # Z (original first axis in ZYX)
-            ])
+            # Ensure the Z component is non‐negative for a consistent "upward" direction
+            if principal_axis[2] < 0:
+                principal_axis = -principal_axis
 
-            # Ensure physical Z-axis (now index 2) is non-negative
-            if principal_axis_reordered[2] < 0:
-                principal_axis_reordered = -principal_axis_reordered
+            # Extract components
+            vx, vy, vz = principal_axis  # X‐component, Y‐component, Z‐component
 
-            # Normalize
-            norm_val = np.linalg.norm(principal_axis_reordered)
-            if norm_val < 1e-12:
-                principal_axis_reordered = np.array([0.0, 0.0, 0.0])
+            # Compute azimuth in [0°, 180°]:
+            if (abs(vx) < 1e-12) and (abs(vy) < 1e-12):
+                # Fiber is (nearly) purely vertical in Z. No well‐defined azimuth in XY plane.
+                azimuth = 0.0
             else:
-                principal_axis_reordered /= norm_val
+                raw_az = np.degrees(np.arctan2(vy, vx))  # in [–180°, +180°]
+                if raw_az < 0:
+                    raw_az += 360.0
+                # Fold into [0°, 180°] to treat opposite directions as the same line
+                if raw_az >= 180.0:
+                    raw_az -= 180.0
+                azimuth = raw_az
 
-                
-            if np.all(principal_axis_reordered[:2] == 0):
-                raw_az = np.nan
-                elevation = 90.0  # Pure Z-axis
+            # Compute elevation in [0°, 90°]:
+            # Elevation = angle between the vector and the XY plane
+            horizontal_length = np.sqrt(vx**2 + vy**2)
+            if horizontal_length < 1e-12:
+                # Purely vertical fiber
+                elevation = 90.0
             else:
-                raw_az = np.degrees(np.arctan2(principal_axis_reordered[1], principal_axis_reordered[0]))  # Y/X
-                elevation = np.degrees(np.arccos(principal_axis_reordered[2]))  # Z-axis angle
-            azimuth = (raw_az) % 180  # Convert to [0°, 180°]
-
+                elevation = np.degrees(np.arctan2(vz, horizontal_length))
             print(f"Fiber {idx + 1}:  Diameter = {avg_diameter:.2f} µm, Azimuth = {azimuth:.2f}°, Elevation = {elevation:.2f}°")
-
-            all_elevations.append(elevation)
+            # Collect in the lists
             all_azimuths.append(azimuth)
+            all_elevations.append(elevation)
 
         except Exception as e:
-            logging.error(f"Fiber {idx + 1}: PCA failed with error: {e}")
-            all_diameters.pop()  # Remove the diameter we just added
+            logging.error(f"Fiber {idx+1}: PCA failed with error: {e}. Skipping.")
+            all_diameters.pop()
             continue
 
-        # 6) Curvature
+        # STEP 6: Compute curvature in µm⁻¹
         curvature = compute_curvature(fiber_scaled)
 
-        # Collect:
+        # Store properties
         fiber_properties.append({
             'length': path_length,
             'diameter': avg_diameter,
             'tortuosity': tortuosity,
-            'orientation': principal_axis,
+            # We can store the PCA axis in (X, Y, Z) or in (Z, Y, X). Here we keep the PCA result as (X, Y, Z).
+            'orientation': principal_axis,  
             'azimuth': azimuth,
             'elevation': elevation,
             'curvature': curvature
         })
 
+        # Accumulate weighted sums for length‐weighted averages
         total_length += path_length
         weighted_azimuth += path_length * azimuth
         weighted_elevation += path_length * elevation
         weighted_diameter += path_length * avg_diameter
 
-    # Print summary statistics
+    # -------------------------------------------------------------------------
+    # PRINT SUMMARY STATISTICS
     if fiber_properties:
-        avg_diameter = np.mean(all_diameters)
-        std_diameter = np.std(all_diameters)
-        avg_elevation = np.mean(all_elevations)
-        std_elevation = np.std(all_elevations)
-        avg_azimuth = np.mean(all_azimuths)
-        std_azimuth = np.std(all_azimuths)
-        
+        # Unweighted mean ± std
+        mean_diam = np.mean(all_diameters)
+        std_diam = np.std(all_diameters)
+        mean_el = np.mean(all_elevations)
+        std_el = np.std(all_elevations)
+        mean_az = np.mean(all_azimuths)
+        std_az = np.std(all_azimuths)
+
         print("\nFiber Property Summary:")
-        print(f"Average Diameter: {avg_diameter:.2f} ± {std_diameter:.2f} µm")
-        print(f"Average Elevation: {avg_elevation:.2f} ± {std_elevation:.2f}°")
-        print(f"Average Azimuth: {avg_azimuth:.2f} ± {std_azimuth:.2f}°")
+        print(f"  Average Diameter:  {mean_diam:.2f} ± {std_diam:.2f} µm")
+        print(f"  Average Elevation: {mean_el:.2f} ± {std_el:.2f}°")
+        print(f"  Average Azimuth:   {mean_az:.2f} ± {std_az:.2f}°")
 
-    if total_length > 0:
-        avg_azimuth = weighted_azimuth / total_length
-        avg_elevation = weighted_elevation / total_length
-        avg_diameter = weighted_diameter / total_length
-        print(f"\nLength-Weighted Averages:")
-        print(f"Azimuth: {avg_azimuth:.2f}°")
-        print(f"Elevation: {avg_elevation:.2f}°")
-        print(f"Diameter: {avg_diameter:.2f} µm")
-
-    # else:
-    #     print("\nNo valid fibers found for property calculation.")
+        # Length‐weighted averages
+        if total_length > 0:
+            wa = weighted_azimuth / total_length
+            we = weighted_elevation / total_length
+            wd = weighted_diameter / total_length
+            print("\nLength‐Weighted Averages:")
+            print(f"  Azimuth:   {wa:.2f}°")
+            print(f"  Elevation: {we:.2f}°")
+            print(f"  Diameter:  {wd:.2f} µm")
 
     logging.info(f"Computed properties for {len(fiber_properties)} valid fibers.")
     return fiber_properties
+
+def save_fiber_analysis_to_csv(output_filename, z_stack, volume_fraction, mean_radius, tort_threshold, traced_fibers, fiber_props):
+    """
+    Save all fiber analysis data to a CSV file.
+    """
+    import pandas as pd
+    import os
+    from datetime import datetime
+
+    # Create a dictionary for global metrics
+    global_metrics = {
+        'timestamp': datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
+        'input_file': input_file,
+        'image_shape_z': z_stack.shape[0],
+        'image_shape_y': z_stack.shape[1],
+        'image_shape_x': z_stack.shape[2],
+        'volume_fraction': volume_fraction,
+        'mean_radius_microns': mean_radius,
+        'mean_diameter_microns': 2 * mean_radius,
+        'tortuosity_threshold': tort_threshold,
+        'total_fibers': len(traced_fibers)
+    }
+
+    # Calculate summary statistics from fiber properties
+    if fiber_props:
+        lengths = [p['length'] for p in fiber_props]
+        diameters = [p['diameter'] for p in fiber_props]
+        tortuosities = [p['tortuosity'] for p in fiber_props if not np.isinf(p['tortuosity'])]
+        azimuths = [p['azimuth'] for p in fiber_props if not np.isnan(p['azimuth'])]
+        elevations = [p['elevation'] for p in fiber_props if not np.isnan(p['elevation'])]
+        curvatures = [p['curvature'] for p in fiber_props if not np.isnan(p['curvature'])]
+
+        # Add summary statistics to global metrics
+        global_metrics.update({
+            'avg_fiber_length': np.mean(lengths),
+            'std_fiber_length': np.std(lengths),
+            'avg_fiber_diameter': np.mean(diameters),
+            'std_fiber_diameter': np.std(diameters),
+            'avg_tortuosity': np.mean(tortuosities) if tortuosities else np.nan,
+            'std_tortuosity': np.std(tortuosities) if tortuosities else np.nan,
+            'avg_azimuth': np.mean(azimuths) if azimuths else np.nan,
+            'std_azimuth': np.std(azimuths) if azimuths else np.nan,
+            'avg_elevation': np.mean(elevations) if elevations else np.nan,
+            'std_elevation': np.std(elevations) if elevations else np.nan,
+            'avg_curvature': np.mean(curvatures) if curvatures else np.nan,
+            'std_curvature': np.std(curvatures) if curvatures else np.nan
+        })
+
+    # Save global metrics to one CSV file
+    global_df = pd.DataFrame([global_metrics])
+    global_df.to_csv(f'{output_filename}_summary.csv', index=False)
+    logging.info(f"Saved summary metrics to {output_filename}_summary.csv")
+
+    # Save individual fiber data to another CSV file
+    if fiber_props:
+        fiber_data = []
+        for i, prop in enumerate(fiber_props):
+            fiber_data.append({
+                'fiber_id': i + 1,
+                'length': prop['length'],
+                'diameter': prop['diameter'],
+                'tortuosity': prop['tortuosity'],
+                'azimuth': prop['azimuth'],
+                'elevation': prop['elevation'],
+                'curvature': prop['curvature']
+            })
+        fiber_df = pd.DataFrame(fiber_data)
+        fiber_df.to_csv(f'{output_filename}_individual_fibers.csv', index=False)
+        logging.info(f"Saved individual fiber data to {output_filename}_individual_fibers.csv")
+
 
 ########################################################
 #               Overlay TIFF Creation
@@ -849,6 +1128,8 @@ def save_overlay_tiff_stack(z_stack, traced_fibers, output_filename="fiber_overl
 
     tiff.imwrite(output_filename, rgb_stack, photometric='rgb')
     logging.info(f"Overlay TIFF saved as {output_filename}.")
+
+
 
 ########################################################
 #         3D Visualization with Equal Axis Scaling
@@ -965,7 +1246,11 @@ def display_random_slice_comparison(z_stack, thresh_segment, filtered_segment, o
       4) Overlay from saved TIFF
     """
     num_slices = z_stack.shape[0]
-    slice_idx = random.randint(0, num_slices - 1)
+    
+    if slice_selection is None:
+        slice_idx = random.randint(0, num_slices - 1)
+    else:
+        slice_idx = min(max(0, slice_selection - 1), num_slices - 1)
     logging.info(f"Displaying comparison for slice {slice_idx}")
 
     # Original
@@ -1138,25 +1423,11 @@ def main():
     logging.info("Loading data...")
     try:
         if input_file.endswith('.mat'):
-            # 1) LOAD .mat
-            mat = loadmat(input_file)
-            if mat_variable_name in mat:
-                z_stack = mat[mat_variable_name]
-                z_stack = np.transpose(z_stack, (2, 1, 0))
-                logging.info(f"Loaded variable '{mat_variable_name}' from .mat file.")
-            else:
-                data_keys = [k for k in mat.keys() if not k.startswith('__')]
-                if len(data_keys) == 1:
-                    key = data_keys[0]
-                    z_stack = mat[key]
-                    logging.info(f"Using variable '{key}' from {input_file} as fiber volume.")
-                else:
-                    raise ValueError(
-                        f"Variable '{mat_variable_name}' not found in {input_file}, "
-                        f"and multiple candidate variables exist. Please specify the name."
-                    )
-            # If .mat is known to be binary, skip threshold
+            z_stack = load_mat_any(input_file, mat_variable_name)
+            logging.info(f"Loaded '{input_file}' (shape {z_stack.shape}).")
+            # These MAT files are already binary (0/1), so:
             thresh_segment = (z_stack > 0).astype(bool)
+
 
         elif input_file.endswith('.czi'):
             # 2) LOAD .czi (if needed)
@@ -1172,7 +1443,7 @@ def main():
             z_stack = np.squeeze(z_stack)
             # (Optional) thresholding
             # Example using adaptive threshold:
-            offset_value = -25
+            offset_value = -23
             thresh_segment = adaptive_threshold_3d(z_stack, block_size=21, offset=offset_value)
 
     except Exception as e:
@@ -1184,37 +1455,26 @@ def main():
     validate_input_data(z_stack)
     logging.info(f"Image shape = {z_stack.shape}, intensity range=({z_stack.min()}, {z_stack.max()})")
 
-    # Morphological filtering on the thresholded segment
-    # filtered_segment = binary_dilation(thresh_segment, footprint=cube(3))
-    # filtered_segment = binary_erosion(filtered_segment, footprint=cube(3))
-
     from skimage.morphology import binary_opening, binary_closing, cube
     from skimage.measure import label, regionprops
 
-    # def remove_small_objects(binary_image, min_size=50):
-    #     labeled = label(binary_image)
-    #     filtered = np.zeros_like(binary_image)
-    #     for region in regionprops(labeled):
-    #         if region.area >= min_size:  # Keep only large-enough objects
-    #             filtered[labeled == region.label] = 1
-    #     return filtered
 
-    # filtered_segment = remove_small_objects(thresh_segment, min_size=5)
-    # img_f = util.img_as_float(z_stack)
-    # img_gamma = exposure.adjust_gamma(img_f, gamma=0.5)
+    def remove_small_objects(binary_image, min_size=50):
+        labeled = label(binary_image)
+        filtered = np.zeros_like(binary_image)
+        for region in regionprops(labeled):
+            if region.area >= min_size:  # Keep only large-enough objects
+                filtered[labeled == region.label] = 1
+        return filtered
 
-    # # 2.2 (optional) denoise — skip or insert gaussian_filter if needed
-    # img_smooth = img_gamma
-
-    # # 2.3 Threshold
-    # tval = threshold_otsu(img_smooth)
-    # filtered_segment = img_smooth > tval
+    filtered_segment = remove_small_objects(thresh_segment, min_size=3)
 
     # se = ball(1)
     # filtered_segment = binary_opening(filtered_segment, se)
+    
     # filtered_segment = binary_closing(filtered_segment, se)
 
-    filtered_segment = thresh_segment
+    # filtered_segment = thresh_segment
     # filtered_segment = binary_closing(filtered_segment, ball(1))
     # filtered_segment = binary_dilation(filtered_segment, ball(1))
 
@@ -1234,7 +1494,11 @@ def main():
 
     # Segment skeleton -> paths
     coords = np.column_stack(np.where(skeleton))  # (N,3) voxel coords
-    paths = segment_skeleton(skeleton, coords, angle_threshold_degs=80)
+    paths = segment_skeleton(skeleton, coords, angle_threshold_degs=70)
+
+    if len(paths) > max_fibers_to_process:
+        logging.info(f"Limiting initial paths to {max_fibers_to_process} out of {len(paths)} total")
+        paths = paths[:max_fibers_to_process]
 
     # Compute a tortuosity threshold
     tort_threshold = compute_initial_tortuosity(coords, paths, sampling)
@@ -1248,7 +1512,7 @@ def main():
 
     # Fiber merging/tracing in real space (microns)
     traced_fibers = fiber_tracing(poly_tracks, track_props, sampling,
-                                  max_distance=8.0,  # 8 microns search radius
+                                  max_distance=10.0,  # 8 microns search radius
                                   angle_thresh=70.0)
     logging.info(f"Traced {len(traced_fibers)} fibers after merging.")
 
@@ -1289,11 +1553,16 @@ def main():
 
     print(coords_all.shape, az_all.shape)
 
+    blues_trunc  = truncate_colormap('Blues',  minval=0.2, maxval=1.0)
+    greens_trunc = truncate_colormap('Greens', minval=0.2, maxval=1.0)
+    reds_trunc   = truncate_colormap('Reds',   minval=0.2, maxval=1.0)
+
+
     plot_colored_fibers_2d_projection(
         traced_fibers,
         fiber_props,
         color_by='azimuth',
-        cmap_name='Blues',  # blue gradient for azimuth
+        cmap_name= blues_trunc,  # blue gradient for azimuth
         vmin=0,
         vmax=180,
         title="2D Max Projection Colored by Azimuth (°)"
@@ -1303,7 +1572,7 @@ def main():
         traced_fibers,
         fiber_props,
         color_by='elevation',
-        cmap_name='Greens',
+        cmap_name=greens_trunc,
         vmin=0,
         vmax=90,
         title="Skeleton colored by Elevation (°)"
@@ -1313,12 +1582,22 @@ def main():
         traced_fibers,
         fiber_props,
         color_by='diameter',
-        cmap_name='Reds',
+        cmap_name=reds_trunc,
         vmin=min(fp['diameter'] for fp in fiber_props),
         vmax=max(fp['diameter'] for fp in fiber_props),
         title="Skeleton colored by Diameter (µm)"
     )
-
+    # output_base = os.path.splitext(input_file)[0]  # Use input filename as base
+    output_base = "fiber_stats" # Use input filename as base
+    save_fiber_analysis_to_csv(
+        output_base,
+        z_stack,
+        volume_fraction,
+        mean_rad,
+        tort_threshold,
+        traced_fibers,
+        fiber_props
+    )
     # Display random slice comparison (4 distinct images)
     display_random_slice_comparison(z_stack, thresh_segment, filtered_segment, overlay_filename)
 
