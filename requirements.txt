@@ -1,7 +1,8 @@
 numpy>=1.25
 scipy>=1.11
-scikit-image>=0.21
+scikit-image>=0.25
 matplotlib>=3.8
 scikit-learn>=1.4
 tifffile>=2024.4.18
 czifile>=2019.7.2      # remove if you never load .czi
+pandas>=1.5.0

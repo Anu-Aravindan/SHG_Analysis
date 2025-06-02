@@ -5,14 +5,13 @@ from skimage import io as skio
 from skimage.morphology import (
     binary_dilation,
     binary_erosion,
-    skeletonize_3d,
+    skeletonize,
     cube
 )
 from skimage import exposure, util                              # ← NEW
 from skimage.morphology import (
     binary_dilation,
     binary_erosion,
-    skeletonize_3d,
     cube,
     ball                                                    # ← NEW
 )
@@ -1484,7 +1483,7 @@ def main():
 
 
     # Skeletonize
-    skeleton = skeletonize_3d(filtered_segment)
+    skeleton = skeletonize(filtered_segment)
 
     # Distance transform. dt_image has the same shape,
     # but the *values* are in microns because sampling is passed.
